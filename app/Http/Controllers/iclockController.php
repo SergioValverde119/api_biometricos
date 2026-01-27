@@ -38,14 +38,16 @@ class iclockController extends Controller
         );
 
         // Respuesta estándar ADMS
-        return "GET OPTION FROM: {$sn}\r\n" .
-            "Stamp=9999\r\n" .
-            "OpStamp=" . time() . "\r\n" .
-            "ErrorDelay=60\r\n" .
-            "Delay=30\r\n" .
-            "TransInterval=1\r\n" .
-            "Realtime=1\r\n" .
-            "Encrypt=0";
+       $response = "GET OPTION FROM: {$sn}\r\n" .
+                "Stamp=9999\r\n" .
+                "OpStamp=" . time() . "\r\n" .
+                "ErrorDelay=60\r\n" .
+                "Delay=30\r\n" .
+                "TransInterval=1\r\n" .
+                "Realtime=1\r\n" .
+                "Encrypt=0";
+
+        return response($response)->header('Content-Type', 'text/plain');
     }
 
     /**
@@ -106,12 +108,12 @@ class iclockController extends Controller
                 DB::table('attendances')->insert($attendances);
             }
 
-            return "OK"; // Respondemos OK simple para liberar el buffer del equipo
+            return response("OK")->header('Content-Type', 'text/plain'); // Respondemos OK simple para liberar el buffer del equipo
 
         } catch (\Exception $e) {
             // Si algo falla, lo guardamos en el log pero NO bloqueamos el equipo
             Log::channel('daily')->error("ERROR en receiveRecords ($sn): " . $e->getMessage());
-            return "OK"; 
+            return response("OK")->header('Content-Type', 'text/plain');
         }
     }
 
@@ -130,6 +132,6 @@ class iclockController extends Controller
             ['online' => now()]
         );
 
-        return "OK"; // Por ahora siempre OK hasta que implementemos comandos
+        return response("OK")->header('Content-Type', 'text/plain'); // Por ahora siempre OK hasta que implementemos comandos
     }
 }

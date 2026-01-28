@@ -9,6 +9,7 @@ use App\Models\BiometricoAsistencia;
 use App\Models\BiometricoConfiguracion;
 use App\Models\BiometricoComando;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
 
 class iclockController extends Controller
 {
@@ -50,6 +51,10 @@ class iclockController extends Controller
         $table = $request->query('table');
         $rawData = $request->getContent();
 
+        // Log para depuración en tiempo real
+        Log::debug("DATA_RAW de $sn: " . substr($rawData, 0, 500));
+
+        // 1. Procesamiento de ASISTENCIAS (ATTLOG)
         if ($table === 'ATTLOG') {
             $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
             $toInsert = [];
@@ -57,17 +62,20 @@ class iclockController extends Controller
             $timestamps = [];
 
             foreach ($lines as $line) {
-                if (empty(trim($line))) continue;
-                $data = explode("\t", $line);
+                if (empty(trim($line)) || str_starts_with($line, 'OPLOG')) continue;
+                $data = preg_split('/\s+/', trim($line)); // Más robusto con espacios/tabs
 
-                if (isset($data[0]) && isset($data[1])) {
+                if (count($data) >= 2) {
                     $userIds[] = $data[0];
-                    $timestamps[] = $data[1];
+                    $timestamps[] = $data[1] . ' ' . ($data[2] ?? '00:00:00');
+                    
+                    $fechaFormateada = $data[1] . ' ' . ($data[2] ?? '00:00:00');
+
                     $toInsert[] = [
                         'user_id' => $data[0],
-                        'fecha_hora' => $data[1],
-                        'estado' => $data[2] ?? 0,
-                        'tipo_verificacion' => $data[3] ?? 0,
+                        'fecha_hora' => $fechaFormateada,
+                        'estado' => $data[3] ?? 0,
+                        'tipo_verificacion' => $data[4] ?? 0,
                         'sn' => $sn,
                         'created_at' => now(),
                         'updated_at' => now()
@@ -76,12 +84,11 @@ class iclockController extends Controller
             }
 
             if (!empty($toInsert)) {
-                // Validación masiva de duplicados para optimizar el rendimiento
                 $existentes = BiometricoAsistencia::where('sn', $sn)
                     ->whereIn('user_id', array_unique($userIds))
                     ->whereIn('fecha_hora', array_unique($timestamps))
                     ->get(['user_id', 'fecha_hora'])
-                    ->map(fn($item) => $item->user_id . '|' . $item->fecha_hora)
+                    ->map(fn($item) => $item->user_id . '|' . $item->fecha_hora->format('Y-m-d H:i:s'))
                     ->toArray();
 
                 $finalInsert = array_filter($toInsert, function($item) use ($existentes) {
@@ -90,23 +97,49 @@ class iclockController extends Controller
 
                 if (!empty($finalInsert)) {
                     BiometricoAsistencia::insert($finalInsert);
+                    Log::info("ASISTENCIA: " . count($finalInsert) . " nuevas de $sn");
                 }
             }
         }
 
-        if ($table === 'OPERLOG') {
+        // 2. Procesamiento de LOGS DE OPERACION (OPLOG)
+        if ($table === 'OPERLOG' || $table === 'OPLOG' || str_contains($rawData, 'OPLOG')) {
             $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+            $opsGuardadas = 0;
+
             foreach ($lines as $line) {
-                if (empty(trim($line))) continue;
-                $data = explode("\t", $line);
+                $line = trim($line);
+                if (empty($line) || !str_starts_with($line, 'OPLOG')) continue;
                 
-                BiometricoConfiguracion::create([
-                    'sn'           => $sn,
-                    'parametro'    => $data[3] ?? 'CONFIG_CHANGE',
-                    'user_id'      => $data[1] ?? null,
-                    'fecha_hora'   => $data[2] ?? now(),
-                    'detalles_raw' => $line
-                ]);
+                // Usamos regex para capturar los campos separados por tabs o múltiples espacios
+                $data = preg_split('/\s+/', $line);
+                
+                if (count($data) >= 4) {
+                    // En el nombre de Jesús, parseamos la fecha con cuidado
+                    // Formato esperado: OPLOG [Type] [AdminID] [Fecha] [Hora] [Param] ...
+                    $fechaHoraString = $data[3] . ' ' . ($data[4] ?? '00:00:00');
+                    
+                    try {
+                        $fechaValida = Carbon::parse($fechaHoraString);
+                        
+                        // Si el parámetro está en la posición 5 (porque fecha y hora son 3 y 4)
+                        $parametro = $data[5] ?? $data[1];
+
+                        BiometricoConfiguracion::create([
+                            'sn'           => $sn,
+                            'parametro'    => $parametro,
+                            'user_id'      => $data[2] ?? null,
+                            'fecha_hora'   => $fechaValida,
+                            'detalles_raw' => $line
+                        ]);
+                        $opsGuardadas++;
+                    } catch (\Exception $e) {
+                        Log::error("Error parseando fecha OPLOG: " . $fechaHoraString);
+                    }
+                }
+            }
+            if ($opsGuardadas > 0) {
+                Log::info("OPERLOG: $opsGuardadas registros guardados para $sn");
             }
         }
 
@@ -122,15 +155,21 @@ class iclockController extends Controller
 
         BiometricoDispositivo::where('sn', $sn)->update(['ultima_conexion' => now()]);
 
-        // Agregamos pista de tipo para el IDE
         /** @var BiometricoComando|null $comando */
         $comando = BiometricoComando::where('sn', $sn)
-                    ->where('estado', 'pendiente')
+                    ->where(function($query) {
+                        $query->where('estado', 'pendiente')
+                              ->orWhere(function($q) {
+                                  $q->where('estado', 'enviado')
+                                    ->where('updated_at', '<', now()->subMinutes(15));
+                              });
+                    })
                     ->oldest()
                     ->first();
 
         if ($comando) {
             $comando->estado = 'enviado';
+            $comando->updated_at = now(); 
             $comando->save();
             
             return $this->cleanResponse("C:{$comando->id}:{$comando->comando}");
@@ -146,11 +185,9 @@ class iclockController extends Controller
     {
         $sn = $request->query('SN');
         $content = $request->getContent();
-
         parse_str($content, $result);
 
         if (isset($result['ID'])) {
-            // Agregamos pista de tipo para evitar el error P1013 en save()
             /** @var BiometricoComando|null $comando */
             $comando = BiometricoComando::find($result['ID']);
             
@@ -163,17 +200,14 @@ class iclockController extends Controller
                 $comando->respuesta_dispositivo = $content;
                 $comando->fecha_ejecucion = now();
                 $comando->save();
-
-                Log::info("Comando {$comando->id} finalizado con estado: $nuevoEstado para SN: $sn");
+                
+                Log::info("COMANDO FINALIZADO: ID {$comando->id} SN $sn Resultado: $nuevoEstado");
             }
         }
 
         return $this->cleanResponse("OK");
     }
 
-    /**
-     * Limpieza de respuesta para protocolo ADMS.
-     */
     private function cleanResponse($content)
     {
         return response($content)

@@ -37,17 +37,24 @@ class iclockController extends Controller
             ['online' => now()]
         );
 
-        // Respuesta estándar ADMS
-       $response = "GET OPTION FROM: {$sn}\r\n" .
-                "Stamp=9999\r\n" .
-                "OpStamp=" . time() . "\r\n" .
-                "ErrorDelay=60\r\n" .
-                "Delay=30\r\n" .
-                "TransInterval=1\r\n" .
-                "Realtime=1\r\n" .
-                "Encrypt=0";
+        $content = "GET OPTION FROM: {$sn}\r\n" .
+               "Stamp=9999\r\n" .
+               "OpStamp=" . time() . "\r\n" .
+               "ErrorDelay=60\r\n" .
+               "Delay=30\r\n" .
+               "TransInterval=1\r\n" .
+               "Realtime=1\r\n" .
+               "Encrypt=0\r\n";
 
-        return response($response)->header('Content-Type', 'text/plain');
+        // Respuesta estándar ADMS
+       return response($content)
+        ->header('Content-Type', 'text/plain')
+        ->header('Content-Length', strlen($content))
+        ->header('Cache-Control', 'no-cache, private')
+        ->header('Connection', 'close')
+        // Esto elimina las cookies de la respuesta específica para el biométrico
+        ->withoutCookie('laravel_session')
+        ->withoutCookie('XSRF-TOKEN');
     }
 
     /**

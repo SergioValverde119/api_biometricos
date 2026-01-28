@@ -15,6 +15,6 @@ Route::get('dashboard', function () {
 })->middleware(['auth', 'verified'])->name('dashboard');
 
 
-require __DIR__.'/iclock.php';
+
 require __DIR__.'/biometric_admin.php';
 require __DIR__.'/settings.php';

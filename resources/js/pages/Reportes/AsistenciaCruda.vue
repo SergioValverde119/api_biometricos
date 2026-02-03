@@ -60,7 +60,7 @@ const consultar = () => {
                             <Input 
                                 id="emp_id" 
                                 v-model="form.codigo_empleado" 
-                                placeholder="Ej. 1206977" 
+                                placeholder="Ej. 01010101" 
                                 class="h-10 border-slate-300 focus:ring-2 focus:ring-blue-500" 
                             />
                         </div>

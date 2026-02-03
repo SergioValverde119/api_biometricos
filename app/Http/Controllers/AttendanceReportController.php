@@ -28,6 +28,10 @@ class AttendanceReportController extends Controller
      */
     public function buscar(Request $request)
     {
+
+        if (!$request->has('codigo_empleado')) {
+        return redirect()->route('home');
+    }
         // 1. Validamos los datos de entrada
         $request->validate([
             'codigo_empleado' => 'required|string',

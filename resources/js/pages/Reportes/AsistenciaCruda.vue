@@ -37,7 +37,11 @@ const formatearFecha = (fechaRaw: string) => {
 };
 
 const consultar = () => {
-    form.post(buscar().url, { preserveScroll: true });
+    // Cambiamos post por get
+    form.get(buscar().url, { 
+        preserveScroll: true,
+        preserveState: true 
+    });
 };
 </script>
 

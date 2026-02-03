@@ -8,13 +8,14 @@ use App\Models\BiometricoDispositivo;
 use App\Models\BiometricoAsistencia;
 use App\Models\BiometricoConfiguracion;
 use App\Models\BiometricoComando;
+use App\Models\BiometricoPlantilla;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
 
 class iclockController extends Controller
 {
     /**
-     * Handshake: El saludo inicial del dispositivo.
+     * Handshake: Saludo inicial del dispositivo.
      */
     public function handshake(Request $request)
     {
@@ -26,6 +27,7 @@ class iclockController extends Controller
                 'ip' => $request->ip(),
                 'ultima_conexion' => now(),
                 'activo' => true,
+                'modelo' => $request->input('model', 'SpeedFace-V5L'),
                 'nombre' => $request->input('nombre', 'Dispositivo ' . $sn)
             ]
         );
@@ -43,7 +45,8 @@ class iclockController extends Controller
     }
 
     /**
-     * Recibe los registros de asistencia y configuraciones (POST /iclock/cdata).
+     * Recibe datos (POST /iclock/cdata).
+     * En el nombre de Jesús, procesamos asistencias, plantillas y logs de operación.
      */
     public function receiveRecords(Request $request)
     {
@@ -51,127 +54,152 @@ class iclockController extends Controller
         $table = $request->query('table');
         $rawData = $request->getContent();
 
-        // Log para depuración en tiempo real
-        Log::debug("DATA_RAW de $sn: " . substr($rawData, 0, 500));
-
-        // 1. Procesamiento de ASISTENCIAS (ATTLOG)
+        // 1. PROCESAR ASISTENCIAS (ATTLOG)
         if ($table === 'ATTLOG') {
-            $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
-            $toInsert = [];
-            $userIds = [];
-            $timestamps = [];
-
-            foreach ($lines as $line) {
-                if (empty(trim($line)) || str_starts_with($line, 'OPLOG')) continue;
-                $data = preg_split('/\s+/', trim($line)); // Más robusto con espacios/tabs
-
-                if (count($data) >= 2) {
-                    $userIds[] = $data[0];
-                    $timestamps[] = $data[1] . ' ' . ($data[2] ?? '00:00:00');
-                    
-                    $fechaFormateada = $data[1] . ' ' . ($data[2] ?? '00:00:00');
-
-                    $toInsert[] = [
-                        'user_id' => $data[0],
-                        'fecha_hora' => $fechaFormateada,
-                        'estado' => $data[3] ?? 0,
-                        'tipo_verificacion' => $data[4] ?? 0,
-                        'sn' => $sn,
-                        'created_at' => now(),
-                        'updated_at' => now()
-                    ];
-                }
-            }
-
-            if (!empty($toInsert)) {
-                $existentes = BiometricoAsistencia::where('sn', $sn)
-                    ->whereIn('user_id', array_unique($userIds))
-                    ->whereIn('fecha_hora', array_unique($timestamps))
-                    ->get(['user_id', 'fecha_hora'])
-                    ->map(fn($item) => $item->user_id . '|' . $item->fecha_hora->format('Y-m-d H:i:s'))
-                    ->toArray();
-
-                $finalInsert = array_filter($toInsert, function($item) use ($existentes) {
-                    return !in_array($item['user_id'] . '|' . $item['fecha_hora'], $existentes);
-                });
-
-                if (!empty($finalInsert)) {
-                    BiometricoAsistencia::insert($finalInsert);
-                    Log::info("ASISTENCIA: " . count($finalInsert) . " nuevas de $sn");
-                }
-            }
+            $this->processAttLog($sn, $rawData);
         }
 
-        // 2. Procesamiento de LOGS DE OPERACION (OPLOG)
-        if ($table === 'OPERLOG' || $table === 'OPLOG' || str_contains($rawData, 'OPLOG')) {
-            $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
-            $opsGuardadas = 0;
+        // 2. PROCESAR PLANTILLAS (BIODATA / BIOPHOTO)
+        // Se activa tras comandos como 'DATA QUERY BIODATA Type=1'
+        if ($table === 'BIODATA' || $table === 'BIOPHOTO') {
+            $this->processBioData($sn, $rawData);
+        }
 
-            foreach ($lines as $line) {
-                $line = trim($line);
-                if (empty($line) || !str_starts_with($line, 'OPLOG')) continue;
-                
-                // Usamos regex para capturar los campos separados por tabs o múltiples espacios
-                $data = preg_split('/\s+/', $line);
-                
-                if (count($data) >= 4) {
-                    // En el nombre de Jesús, parseamos la fecha con cuidado
-                    // Formato esperado: OPLOG [Type] [AdminID] [Fecha] [Hora] [Param] ...
-                    $fechaHoraString = $data[3] . ' ' . ($data[4] ?? '00:00:00');
-                    
-                    try {
-                        $fechaValida = Carbon::parse($fechaHoraString);
-                        
-                        // Si el parámetro está en la posición 5 (porque fecha y hora son 3 y 4)
-                        $parametro = $data[5] ?? $data[1];
-
-                        BiometricoConfiguracion::create([
-                            'sn'           => $sn,
-                            'parametro'    => $parametro,
-                            'user_id'      => $data[2] ?? null,
-                            'fecha_hora'   => $fechaValida,
-                            'detalles_raw' => $line
-                        ]);
-                        $opsGuardadas++;
-                    } catch (\Exception $e) {
-                        Log::error("Error parseando fecha OPLOG: " . $fechaHoraString);
-                    }
-                }
-            }
-            if ($opsGuardadas > 0) {
-                Log::info("OPERLOG: $opsGuardadas registros guardados para $sn");
-            }
+        // 3. PROCESAR LOGS DE OPERACIÓN (OPERLOG / OPLOG)
+        if ($table === 'OPERLOG' || str_contains($rawData, 'OPLOG')) {
+            $this->processOperLog($sn, $rawData);
         }
 
         return $this->cleanResponse("OK");
     }
 
     /**
-     * El equipo pregunta si hay órdenes pendientes (GET /iclock/getrequest).
+     * Procesa las huellas y rostros que envía el equipo.
+     */
+    private function processBioData($sn, $rawData)
+    {
+        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+        $count = 0;
+        foreach ($lines as $line) {
+            if (empty(trim($line))) continue;
+            
+            // ADMS usa espacios, los convertimos para parse_str
+            parse_str(str_replace(' ', '&', $line), $data);
+
+            if (isset($data['USERID']) && isset($data['TMP'])) {
+                BiometricoPlantilla::updateOrCreate(
+                    [
+                        'user_id_biometrico' => $data['USERID'],
+                        'tipo' => (isset($data['TYPE']) && $data['TYPE'] == '9') ? 'rostro' : 'huella',
+                        'indice' => $data['INDEX'] ?? 0,
+                    ],
+                    [
+                        'template' => $data['TMP'],
+                        'version_algoritmo' => $data['MajorVer'] ?? '10',
+                        'updated_at' => now()
+                    ]
+                );
+                $count++;
+            }
+        }
+        if ($count > 0) {
+            Log::info("BIOMETRIA: Se recibieron y guardaron $count plantillas del equipo $sn");
+        }
+    }
+
+    /**
+     * Procesa las asistencias evitando duplicados manualmente.
+     */
+    private function processAttLog($sn, $rawData)
+    {
+        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+        $toInsert = [];
+        $userIds = [];
+        $timestamps = [];
+
+        foreach ($lines as $line) {
+            if (empty(trim($line))) continue;
+            $data = preg_split('/\s+/', trim($line));
+            
+            if (count($data) >= 2) {
+                $fechaHora = $data[1] . ' ' . ($data[2] ?? '00:00:00');
+                $userIds[] = $data[0];
+                $timestamps[] = $fechaHora;
+
+                $toInsert[] = [
+                    'user_id' => $data[0],
+                    'fecha_hora' => $fechaHora,
+                    'estado' => $data[3] ?? 0,
+                    'tipo_verificacion' => $data[4] ?? 0,
+                    'sn' => $sn,
+                    'created_at' => now(),
+                    'updated_at' => now()
+                ];
+            }
+        }
+
+        if (!empty($toInsert)) {
+            // Buscamos lo que ya existe para no duplicar
+            $existentes = BiometricoAsistencia::where('sn', $sn)
+                ->whereIn('user_id', array_unique($userIds))
+                ->whereIn('fecha_hora', array_unique($timestamps))
+                ->get()
+                ->map(fn($item) => $item->user_id . '|' . $item->fecha_hora->format('Y-m-d H:i:s'))
+                ->toArray();
+
+            $finalInsert = array_filter($toInsert, function($item) use ($existentes) {
+                return !in_array($item['user_id'] . '|' . $item['fecha_hora'], $existentes);
+            });
+
+            if (!empty($finalInsert)) {
+                BiometricoAsistencia::insert($finalInsert);
+                Log::info("ASISTENCIA: " . count($finalInsert) . " nuevas checadas de $sn registradas.");
+            }
+        }
+    }
+
+    /**
+     * Procesa los logs de operación del equipo.
+     */
+    private function processOperLog($sn, $rawData)
+    {
+        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+        foreach ($lines as $line) {
+            if (empty(trim($line))) continue;
+            
+            BiometricoConfiguracion::create([
+                'sn' => $sn,
+                'parametro' => 'LOG_EVENT',
+                'detalles_raw' => $line,
+                'fecha_hora' => now()
+            ]);
+        }
+    }
+
+    /**
+     * Entrega de comandos (GET /iclock/getrequest).
      */
     public function getrequest(Request $request)
     {
         $sn = $request->input('SN');
-
         BiometricoDispositivo::where('sn', $sn)->update(['ultima_conexion' => now()]);
 
-        /** @var BiometricoComando|null $comando */
+        // Evitar saturar si hay uno enviado hace menos de 30 min (Descargas pesadas)
+        $bloqueo = BiometricoComando::where('sn', $sn)
+                    ->where('estado', 'enviado')
+                    ->where('updated_at', '>', now()->subMinutes(30))
+                    ->first();
+
+        if ($bloqueo) return $this->cleanResponse("OK");
+
         $comando = BiometricoComando::where('sn', $sn)
-                    ->where(function($query) {
-                        $query->where('estado', 'pendiente')
-                              ->orWhere(function($q) {
-                                  $q->where('estado', 'enviado')
-                                    ->where('updated_at', '<', now()->subMinutes(15));
-                              });
-                    })
+                    ->whereIn('estado', ['pendiente', 'enviado']) 
                     ->oldest()
                     ->first();
 
         if ($comando) {
-            $comando->estado = 'enviado';
-            $comando->updated_at = now(); 
-            $comando->save();
-            
+            $comando->update(['estado' => 'enviado', 'updated_at' => now()]);
+            Log::info("COMANDO ENVIADO a $sn: {$comando->comando} (ID: {$comando->id})");
             return $this->cleanResponse("C:{$comando->id}:{$comando->comando}");
         }
 
@@ -179,7 +207,7 @@ class iclockController extends Controller
     }
 
     /**
-     * El equipo informa el resultado de la ejecución de un comando (POST /iclock/devicecmd).
+     * Confirmación de comando finalizado (POST /iclock/devicecmd).
      */
     public function receiveCommandResult(Request $request)
     {
@@ -188,20 +216,15 @@ class iclockController extends Controller
         parse_str($content, $result);
 
         if (isset($result['ID'])) {
-            /** @var BiometricoComando|null $comando */
             $comando = BiometricoComando::find($result['ID']);
-            
             if ($comando) {
-                $nuevoEstado = (isset($result['Return']) && $result['Return'] == '0') 
-                                ? 'completado' 
-                                : 'error';
-
-                $comando->estado = $nuevoEstado;
-                $comando->respuesta_dispositivo = $content;
-                $comando->fecha_ejecucion = now();
-                $comando->save();
-                
-                Log::info("COMANDO FINALIZADO: ID {$comando->id} SN $sn Resultado: $nuevoEstado");
+                $status = (isset($result['Return']) && $result['Return'] == '0') ? 'completado' : 'error';
+                $comando->update([
+                    'estado' => $status,
+                    'respuesta_dispositivo' => $content,
+                    'fecha_ejecucion' => now()
+                ]);
+                Log::info("COMANDO FINALIZADO: ID {$result['ID']} SN $sn - Estado: $status");
             }
         }
 

@@ -180,56 +180,68 @@ class iclockController extends Controller
      * Entrega de comandos (GET /iclock/getrequest).
      */
     public function getrequest(Request $request)
-    {
-        $sn = $request->input('SN');
-        BiometricoDispositivo::where('sn', $sn)->update(['ultima_conexion' => now()]);
+{
+    $sn = $request->input('SN');
+    
+    // Actualizamos la última conexión del equipo
+    BiometricoDispositivo::where('sn', $sn)->update(['ultima_conexion' => now()]);
 
-        // Evitar saturar si hay uno enviado hace menos de 30 min (Descargas pesadas)
-        $bloqueo = BiometricoComando::where('sn', $sn)
-                    ->where('estado', 'enviado')
-                    ->where('updated_at', '>', now()->subMinutes(30))
-                    ->first();
+    // Buscamos ÚNICAMENTE el comando más viejo que esté 'pendiente'
+    // Al quitar 'enviado' de aquí, evitamos que un comando se repita
+    $comando = BiometricoComando::where('sn', $sn)
+                ->where('estado', 'pendiente') 
+                ->oldest()
+                ->first();
 
-        if ($bloqueo) return $this->cleanResponse("OK");
-
-        $comando = BiometricoComando::where('sn', $sn)
-                    ->whereIn('estado', ['pendiente', 'enviado']) 
-                    ->oldest()
-                    ->first();
-
-        if ($comando) {
-            $comando->update(['estado' => 'enviado', 'updated_at' => now()]);
-            Log::info("COMANDO ENVIADO a $sn: {$comando->comando} (ID: {$comando->id})");
-            return $this->cleanResponse("C:{$comando->id}:{$comando->comando}");
-        }
-
-        return $this->cleanResponse("OK");
+    if ($comando) {
+        // Marcamos como enviado inmediatamente para que en la siguiente consulta ya no salga
+        $comando->update([
+            'estado' => 'enviado', 
+            'updated_at' => now()
+        ]);
+        
+        Log::info("COMANDO ENVIADO a $sn: {$comando->comando} (ID: {$comando->id})");
+        
+        // Formato estándar ADMS: C:ID:COMANDO
+        return $this->cleanResponse("C:{$comando->id}:{$comando->comando}");
     }
+
+    // Si no hay nada pendiente, respondemos OK para mantener el latido (heartbeat)
+    return $this->cleanResponse("OK");
+}
 
     /**
      * Confirmación de comando finalizado (POST /iclock/devicecmd).
      */
     public function receiveCommandResult(Request $request)
-    {
-        $sn = $request->query('SN');
-        $content = $request->getContent();
-        parse_str($content, $result);
+{
+    $sn = $request->query('SN');
+    $content = $request->getContent();
+    parse_str($content, $result);
 
-        if (isset($result['ID'])) {
-            $comando = BiometricoComando::find($result['ID']);
-            if ($comando) {
-                $status = (isset($result['Return']) && $result['Return'] == '0') ? 'completado' : 'error';
-                $comando->update([
-                    'estado' => $status,
-                    'respuesta_dispositivo' => $content,
-                    'fecha_ejecucion' => now()
-                ]);
-                Log::info("COMANDO FINALIZADO: ID {$result['ID']} SN $sn - Estado: $status");
-            }
+    if (isset($result['ID'])) {
+        // Buscamos el comando
+        $comando = BiometricoComando::find($result['ID']);
+        
+        // Verificamos que sea una instancia real del modelo para que el editor NO marque error
+        if ($comando instanceof \App\Models\BiometricoComando) {
+            // Determinamos el estado basado en el 'Return' del equipo (0 = éxito)
+            $status = (isset($result['Return']) && $result['Return'] == '0') ? 'completado' : 'error';
+            
+            // Aquí el editor ya reconocerá el método 'update'
+            $comando->update([
+                'estado'                => $status,
+                'respuesta_dispositivo' => $content,
+                'fecha_ejecucion'       => now()
+            ]);
+            
+            Log::info("COMANDO FINALIZADO: ID {$result['ID']} SN $sn - Estado: $status");
         }
-
-        return $this->cleanResponse("OK");
     }
+
+    // OBLIGATORIO: Si no respondes OK, el dispositivo reintenta el envío del resultado eternamente
+    return $this->cleanResponse("OK");
+}
 
     private function cleanResponse($content)
     {

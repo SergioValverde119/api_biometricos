@@ -54,6 +54,17 @@ class iclockController extends Controller
         $table = $request->query('table');
         $rawData = $request->getContent();
 
+        Log::debug("CDATA RECIBIDO: SN=$sn | Tabla=$table | Datos=" . substr($rawData, 0, 100));
+
+        if (str_contains($rawData, 'TMP=') || $table === 'BIODATA' || $table === 'FINGERTMP') {
+            $this->processBioData($sn, $rawData);
+        }
+
+        // Si no es biometría y es un log de operación
+        elseif ($table === 'OPERLOG' || str_contains($rawData, 'OPLOG')) {
+            $this->processOperLog($sn, $rawData);
+        }
+
         // 1. PROCESAR ASISTENCIAS (ATTLOG)
         if ($table === 'ATTLOG') {
             $this->processAttLog($sn, $rawData);
@@ -61,14 +72,7 @@ class iclockController extends Controller
 
         // 2. PROCESAR PLANTILLAS (BIODATA / BIOPHOTO)
         // Se activa tras comandos como 'DATA QUERY BIODATA Type=1'
-        if ($table === 'BIODATA' || $table === 'BIOPHOTO') {
-            $this->processBioData($sn, $rawData);
-        }
-
-        // 3. PROCESAR LOGS DE OPERACIÓN (OPERLOG / OPLOG)
-        if ($table === 'OPERLOG' || str_contains($rawData, 'OPLOG')) {
-            $this->processOperLog($sn, $rawData);
-        }
+        
 
         return $this->cleanResponse("OK");
     }
@@ -77,35 +81,52 @@ class iclockController extends Controller
      * Procesa las huellas y rostros que envía el equipo.
      */
     private function processBioData($sn, $rawData)
-    {
-        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
-        $count = 0;
-        foreach ($lines as $line) {
-            if (empty(trim($line))) continue;
-            
-            // ADMS usa espacios, los convertimos para parse_str
-            parse_str(str_replace(' ', '&', $line), $data);
+{
+    $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+    $count = 0;
 
-            if (isset($data['USERID']) && isset($data['TMP'])) {
-                BiometricoPlantilla::updateOrCreate(
-                    [
-                        'user_id_biometrico' => $data['USERID'],
-                        'tipo' => (isset($data['TYPE']) && $data['TYPE'] == '9') ? 'rostro' : 'huella',
-                        'indice' => $data['INDEX'] ?? 0,
-                    ],
-                    [
-                        'template' => $data['TMP'],
-                        'version_algoritmo' => $data['MajorVer'] ?? '10',
-                        'updated_at' => now()
-                    ]
-                );
-                $count++;
-            }
-        }
-        if ($count > 0) {
-            Log::info("BIOMETRIA: Se recibieron y guardaron $count plantillas del equipo $sn");
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line)) continue;
+        
+        // 1. Limpiamos prefijos comunes: "FP ", "BIODATA ", "USERDATA "
+        $cleanLine = preg_replace('/^(FP|BIODATA|USERDATA)\s+/i', '', $line);
+        
+        // 2. Normalizamos espacios y pasamos a formato de query string
+        $cleanLine = preg_replace('/\s+/', ' ', $cleanLine);
+        parse_str(str_replace(' ', '&', $cleanLine), $data);
+
+        // 3. Normalizamos las llaves (Pin vs PIN, Tmp vs TMP)
+        // Convertimos todas las llaves a minúsculas para no fallar
+        $data = array_change_key_case($data, CASE_LOWER);
+
+        $pin = $data['pin'] ?? $data['userid'] ?? null;
+        $template = $data['tmp'] ?? $data['template'] ?? null;
+
+        if ($pin && $template) {
+            // Type 9 siempre es Rostro en estos equipos
+            $tipo = (isset($data['type']) && $data['type'] == '9') ? 'rostro' : 'huella';
+            
+            \App\Models\BiometricoPlantilla::updateOrCreate(
+                [
+                    'user_id_biometrico' => $pin,
+                    'tipo' => $tipo,
+                    'indice' => $data['index'] ?? $data['fid'] ?? 0,
+                ],
+                [
+                    'template' => $template,
+                    'version_algoritmo' => $data['majorver'] ?? '39', // 39 es la versión de rostro que vimos en tu log
+                    'updated_at' => now()
+                ]
+            );
+            $count++;
         }
     }
+
+    if ($count > 0) {
+        Log::info("BIOMETRIA: ¡Gloria a Dios! Se procesaron $count plantillas (Rostros/Huellas) de $sn");
+    }
+}
 
     /**
      * Procesa las asistencias evitando duplicados manualmente.

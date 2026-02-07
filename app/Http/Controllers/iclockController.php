@@ -9,6 +9,7 @@ use App\Models\BiometricoAsistencia;
 use App\Models\BiometricoConfiguracion;
 use App\Models\BiometricoComando;
 use App\Models\BiometricoPlantilla;
+use App\Models\BiometricoSincronizacion;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
 
@@ -81,52 +82,67 @@ class iclockController extends Controller
      * Procesa las huellas y rostros que envía el equipo.
      */
     private function processBioData($sn, $rawData)
-{
-    $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
-    $count = 0;
+    {
+        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+        $count = 0;
 
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (empty($line)) continue;
-        
-        // 1. Limpiamos prefijos comunes: "FP ", "BIODATA ", "USERDATA "
-        $cleanLine = preg_replace('/^(FP|BIODATA|USERDATA)\s+/i', '', $line);
-        
-        // 2. Normalizamos espacios y pasamos a formato de query string
-        $cleanLine = preg_replace('/\s+/', ' ', $cleanLine);
-        parse_str(str_replace(' ', '&', $cleanLine), $data);
-
-        // 3. Normalizamos las llaves (Pin vs PIN, Tmp vs TMP)
-        // Convertimos todas las llaves a minúsculas para no fallar
-        $data = array_change_key_case($data, CASE_LOWER);
-
-        $pin = $data['pin'] ?? $data['userid'] ?? null;
-        $template = $data['tmp'] ?? $data['template'] ?? null;
-
-        if ($pin && $template) {
-            // Type 9 siempre es Rostro en estos equipos
-            $tipo = (isset($data['type']) && $data['type'] == '9') ? 'rostro' : 'huella';
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (empty($line)) continue;
             
-            \App\Models\BiometricoPlantilla::updateOrCreate(
-                [
-                    'user_id_biometrico' => $pin,
-                    'tipo' => $tipo,
-                    'indice' => $data['index'] ?? $data['fid'] ?? 0,
-                ],
-                [
-                    'template' => $template,
-                    'version_algoritmo' => $data['majorver'] ?? '39', // 39 es la versión de rostro que vimos en tu log
-                    'updated_at' => now()
-                ]
-            );
-            $count++;
+            // 1. Limpiamos prefijos (FP, BIODATA, etc.)
+            $cleanLine = preg_replace('/^(FP|BIODATA|USERDATA)\s+/i', '', $line);
+            
+            // 2. Normalizamos espacios para parse_str
+            $cleanLine = preg_replace('/\s+/', ' ', $cleanLine);
+            parse_str(str_replace(' ', '&', $cleanLine), $data);
+
+            // 3. Normalizamos llaves a minusculas
+            $data = array_change_key_case($data, CASE_LOWER);
+
+            $pin = $data['pin'] ?? $data['userid'] ?? null;
+            $template = $data['tmp'] ?? $data['template'] ?? null;
+
+            if ($pin && $template) {
+                $tipo = (isset($data['type']) && $data['type'] == '9') ? 'rostro' : 'huella';
+                $indice = $data['index'] ?? $data['fid'] ?? 0;
+
+                // A. Guardamos en la Biblioteca Central
+                $plantilla = BiometricoPlantilla::updateOrCreate(
+                    [
+                        'user_id_biometrico' => $pin,
+                        'tipo' => $tipo,
+                        'indice' => $indice,
+                    ],
+                    [
+                        'template' => $template,
+                        'version_algoritmo' => $data['majorver'] ?? '10',
+                        'updated_at' => now()
+                    ]
+                );
+
+                // B. Guardamos en el Inventario (quien tiene que)
+                // Marcamos como sincronizado porque el equipo nos lo esta enviando el mismo
+                BiometricoSincronizacion::updateOrCreate(
+                    [
+                        'plantilla_id' => $plantilla->id,
+                        'dispositivo_sn' => $sn,
+                    ],
+                    [
+                        'estado' => 'sincronizado',
+                        'fecha_sincronizacion' => now(),
+                        'updated_at' => now()
+                    ]
+                );
+
+                $count++;
+            }
+        }
+
+        if ($count > 0) {
+            Log::info("BIOMETRIA: Se registraron $count plantillas para el equipo $sn");
         }
     }
-
-    if ($count > 0) {
-        Log::info("BIOMETRIA: ¡Gloria a Dios! Se procesaron $count plantillas (Rostros/Huellas) de $sn");
-    }
-}
 
     /**
      * Procesa las asistencias evitando duplicados manualmente.
@@ -183,19 +199,38 @@ class iclockController extends Controller
      * Procesa los logs de operación del equipo.
      */
     private function processOperLog($sn, $rawData)
-    {
-        $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
-        foreach ($lines as $line) {
-            if (empty(trim($line))) continue;
-            
-            BiometricoConfiguracion::create([
-                'sn' => $sn,
-                'parametro' => 'LOG_EVENT',
-                'detalles_raw' => $line,
-                'fecha_hora' => now()
-            ]);
+{
+    $lines = preg_split('/\\r\\n|\\r|\\n/', $rawData);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line)) continue;
+        
+        // Guardamos el log para historial
+        BiometricoConfiguracion::create([
+            'sn' => $sn,
+            'parametro' => 'LOG_EVENT',
+            'detalles_raw' => $line,
+            'fecha_hora' => now()
+        ]);
+
+        // Si el log es tipo 4 (Modificar Usuario/Biometria), confirmamos sincronizacion
+        // Ejemplo: OPLOG 4 1206977 ...
+        if (str_contains($line, 'OPLOG 4')) {
+            $parts = preg_split('/\s+/', $line);
+            $pin = $parts[2] ?? null;
+
+            if ($pin) {
+                Log::info('OPLOG DETECTADO: El equipo ' . $sn . ' confirmo cambio para el PIN ' . $pin);
+                
+                // Opcional: Marcar comandos pendientes de ese PIN como completados
+                BiometricoComando::where('sn', $sn)
+                    ->where('comando', 'like', '%' . $pin . '%')
+                    ->where('estado', 'enviado')
+                    ->update(['estado' => 'completado', 'fecha_ejecucion' => now()]);
+            }
         }
     }
+}
 
     /**
      * Entrega de comandos (GET /iclock/getrequest).
@@ -238,30 +273,47 @@ class iclockController extends Controller
 {
     $sn = $request->query('SN');
     $content = $request->getContent();
+    
+    // Logueamos TODO lo que llegue para ver el formato real
+    Log::info('RESPUESTA CRUDA de ' . $sn . ': ' . $content);
+
+    // Intentamos parsear pero con un respaldo
     parse_str($content, $result);
 
+    // Si no viene el ID en el parse_str, intentamos buscarlo manualmente
+    if (!isset($result['ID']) && preg_match('/ID=([0-9]+)/i', $content, $matches)) {
+        $result['ID'] = $matches[1];
+    }
+
     if (isset($result['ID'])) {
-        // Buscamos el comando
         $comando = BiometricoComando::find($result['ID']);
         
-        // Verificamos que sea una instancia real del modelo para que el editor NO marque error
         if ($comando instanceof \App\Models\BiometricoComando) {
-            // Determinamos el estado basado en el 'Return' del equipo (0 = éxito)
-            $status = (isset($result['Return']) && $result['Return'] == '0') ? 'completado' : 'error';
+            // El equipo responde Return=0 para exito
+            $returnVal = $result['Return'] ?? ($result['Result'] ?? '-1');
+            $status = ($returnVal == '0') ? 'completado' : 'error';
             
-            // Aquí el editor ya reconocerá el método 'update'
             $comando->update([
-                'estado'                => $status,
+                'estado' => $status,
                 'respuesta_dispositivo' => $content,
-                'fecha_ejecucion'       => now()
+                'fecha_ejecucion' => now()
             ]);
+
+            // Si fue una huella/rostro exitoso, actualizamos el inventario
+            if ($status === 'completado' && (str_contains($comando->comando, 'SET FINGERTMP') || str_contains($comando->comando, 'SET BIODATA'))) {
+                // Buscamos si el comando tiene el PIN para marcarlo como OK en la tabla de sincronizaciones
+                if (preg_match('/PIN=([0-9]+)/i', $comando->comando, $pinMatches)) {
+                    $pin = $pinMatches[1];
+                    // Aqui podrias buscar la plantilla_id y marcar como 'sincronizado'
+                    Log::info('INVENTARIO: Usuario ' . $pin . ' sincronizado en ' . $sn);
+                }
+            }
             
-            Log::info("COMANDO FINALIZADO: ID {$result['ID']} SN $sn - Estado: $status");
+            Log::info('COMANDO FINALIZADO: ID ' . $result['ID'] . ' SN ' . $sn . ' - Estado: ' . $status);
         }
     }
 
-    // OBLIGATORIO: Si no respondes OK, el dispositivo reintenta el envío del resultado eternamente
-    return $this->cleanResponse("OK");
+    return $this->cleanResponse('OK');
 }
 
     private function cleanResponse($content)

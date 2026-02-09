@@ -269,52 +269,63 @@ class iclockController extends Controller
     /**
      * Confirmación de comando finalizado (POST /iclock/devicecmd).
      */
-    public function receiveCommandResult(Request $request)
-{
-    $sn = $request->query('SN');
-    $content = $request->getContent();
-    
-    // Logueamos TODO lo que llegue para ver el formato real
-    Log::info('RESPUESTA CRUDA de ' . $sn . ': ' . $content);
-
-    // Intentamos parsear pero con un respaldo
-    parse_str($content, $result);
-
-    // Si no viene el ID en el parse_str, intentamos buscarlo manualmente
-    if (!isset($result['ID']) && preg_match('/ID=([0-9]+)/i', $content, $matches)) {
-        $result['ID'] = $matches[1];
-    }
-
-    if (isset($result['ID'])) {
-        $comando = BiometricoComando::find($result['ID']);
+     public function receiveCommandResult(Request $request)
+    {
+        $sn = $request->query('SN');
         
-        if ($comando instanceof \App\Models\BiometricoComando) {
-            // El equipo responde Return=0 para exito
-            $returnVal = $result['Return'] ?? ($result['Result'] ?? '-1');
-            $status = ($returnVal == '0') ? 'completado' : 'error';
-            
-            $comando->update([
-                'estado' => $status,
-                'respuesta_dispositivo' => $content,
-                'fecha_ejecucion' => now()
-            ]);
+        // LEEMOS EL FLUJO DE ENTRADA DIRECTO PARA VER TODO
+        $content = file_get_contents('php://input');
+        
+        // Logueamos TODO lo que llegue para ver el formato real
+        Log::info('RESPUESTA CRUDA REAL de ' . $sn . ': ' . $content);
 
-            // Si fue una huella/rostro exitoso, actualizamos el inventario
-            if ($status === 'completado' && (str_contains($comando->comando, 'SET FINGERTMP') || str_contains($comando->comando, 'SET BIODATA'))) {
-                // Buscamos si el comando tiene el PIN para marcarlo como OK en la tabla de sincronizaciones
-                if (preg_match('/PIN=([0-9]+)/i', $comando->comando, $pinMatches)) {
-                    $pin = $pinMatches[1];
-                    // Aqui podrias buscar la plantilla_id y marcar como 'sincronizado'
-                    Log::info('INVENTARIO: Usuario ' . $pin . ' sincronizado en ' . $sn);
-                }
-            }
-            
-            Log::info('COMANDO FINALIZADO: ID ' . $result['ID'] . ' SN ' . $sn . ' - Estado: ' . $status);
+        // Intentamos parsear pero con un respaldo
+        parse_str($content, $result);
+
+        // Si no viene el ID en el parse_str, intentamos buscarlo manualmente
+        if (!isset($result['ID']) && preg_match('/ID=([0-9]+)/i', $content, $matches)) {
+            $result['ID'] = $matches[1];
         }
-    }
 
-    return $this->cleanResponse('OK');
-}
+        if (isset($result['ID'])) {
+            // Buscamos el comando
+            $comando = BiometricoComando::find($result['ID']);
+            
+            // Verificamos que sea una instancia real del modelo para que el editor NO marque error
+            if ($comando instanceof \App\Models\BiometricoComando) {
+                // El equipo responde Return=0 para exito
+                // A veces manda 'Result' en lugar de 'Return'
+                $returnVal = $result['Return'] ?? ($result['Result'] ?? '-1');
+                
+                // Algunos equipos mandan "Return=0\n" con salto de linea
+                $returnVal = trim($returnVal);
+                
+                $status = ($returnVal === '0') ? 'completado' : 'error';
+                
+                // Aquí el editor ya reconocerá el método 'update'
+                $comando->update([
+                    'estado'                => $status,
+                    'respuesta_dispositivo' => $content,
+                    'fecha_ejecucion'       => now()
+                ]);
+
+                // Si fue una huella/rostro exitoso, actualizamos el inventario
+                if ($status === 'completado' && (str_contains($comando->comando, 'SET FINGERTMP') || str_contains($comando->comando, 'SET BIODATA'))) {
+                    // Buscamos si el comando tiene el PIN para marcarlo como OK en la tabla de sincronizaciones
+                    if (preg_match('/(PIN|Pin)=([0-9]+)/i', $comando->comando, $pinMatches)) {
+                        $pin = $pinMatches[2];
+                        // Aqui podrias buscar la plantilla_id y marcar como 'sincronizado'
+                        Log::info('INVENTARIO: Usuario ' . $pin . ' sincronizado en ' . $sn);
+                    }
+                }
+                
+                Log::info('COMANDO FINALIZADO: ID ' . $result['ID'] . ' SN ' . $sn . ' - Estado: ' . $status . ' (Retorno: ' . $returnVal . ')');
+            }
+        }
+
+        // OBLIGATORIO: Si no respondes OK, el dispositivo reintenta el envío del resultado eternamente
+        return $this->cleanResponse("OK");
+    }
 
     private function cleanResponse($content)
     {

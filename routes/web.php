@@ -12,6 +12,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     
     // La ruta de búsqueda puede quedarse igual o cambiarla para que sea consistente
     Route::get('/buscar-asistencia', [AttendanceReportController::class, 'buscar'])->name('asistencia.buscar');
+    Route::get('/exportar-asistencia', [AttendanceReportController::class, 'exportar'])->name('asistencia.exportar');
 
     Route::get('dashboard', function () {
         return Inertia::render('Dashboard');

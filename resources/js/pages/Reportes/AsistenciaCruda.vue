@@ -4,7 +4,9 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { buscar } from '@/actions/App/Http/Controllers/AttendanceReportController';
+// Importamos 'buscar' y 'exportar' del controlador
+import { buscar, exportar } from '@/actions/App/Http/Controllers/AttendanceReportController';
+import { ArrowDownTrayIcon } from '@heroicons/vue/24/outline'; // Icono opcional si lo tienes instalado
 
 const props = defineProps<{
     checadas: any[];
@@ -43,6 +45,21 @@ const consultar = () => {
         preserveState: true 
     });
 };
+
+// --- NUEVA FUNCIÓN PARA EXPORTAR ---
+const descargarExcel = () => {
+    // Construimos la URL con los parámetros actuales del formulario
+    // Usamos URLSearchParams para manejar correctamente los caracteres especiales
+    const params = new URLSearchParams({
+        user_id: form.codigo_empleado, // Mapeamos 'codigo_empleado' del form a 'user_id' del backend
+        fecha_inicio: form.fecha_inicio,
+        fecha_fin: form.fecha_fin
+    });
+
+    // Redirigimos para descargar el archivo usando la ruta generada por Wayfinder
+    // La ruta 'exportar' corresponde al método exportar() en AttendanceReportController
+    window.location.href = `${exportar().url}?${params.toString()}`;
+};
 </script>
 
 <template>
@@ -58,7 +75,8 @@ const consultar = () => {
                     </CardTitle>
                 </CardHeader>
                 <CardContent class="pt-6 pb-6">
-                    <form @submit.prevent="consultar" class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                    <!-- Cambiamos @submit.prevent="consultar" para manejar botones separados -->
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
                         <div class="grid gap-2">
                             <Label for="emp_id" class="font-bold text-xs uppercase text-slate-600">ID Empleado</Label>
                             <Input 
@@ -86,15 +104,33 @@ const consultar = () => {
                                 class="h-10 border-slate-300" 
                             />
                         </div>
-                        <div>
+                        
+                        <!-- Contenedor de Botones -->
+                        <div class="flex gap-2">
                             <Button 
-                                class="w-full h-10 font-bold bg-blue-600 hover:bg-blue-700 shadow-sm transition-all" 
+                                @click="consultar"
+                                class="flex-1 h-10 font-bold bg-blue-600 hover:bg-blue-700 shadow-sm transition-all text-white" 
                                 :disabled="form.processing"
                             >
-                                {{ form.processing ? 'Buscando...' : 'Consultar' }}
+                                {{ form.processing ? '...' : 'Consultar' }}
+                            </Button>
+
+                            <!-- BOTÓN DE EXCEL -->
+                            <Button 
+                                @click="descargarExcel"
+                                variant="outline"
+                                class="h-10 px-4 font-bold border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm"
+                                :disabled="form.processing"
+                                title="Descargar reporte en Excel"
+                            >
+                                <!-- Icono SVG manual si no tienes Heroicons instalados -->
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 text-green-600">
+                                  <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                                </svg>
+                                <span class="sr-only md:not-sr-only md:ml-2">Excel</span>
                             </Button>
                         </div>
-                    </form>
+                    </div>
                 </CardContent>
             </Card>
 

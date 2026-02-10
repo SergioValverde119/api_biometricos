@@ -3,8 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Models\BiometricoAsistencia;
+use App\Exports\ReporteAsistenciasExport;
+use Maatwebsite\Excel\Facades\Excel;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
+use Carbon\Carbon;
 
 class AttendanceReportController extends Controller
 {
@@ -67,5 +70,40 @@ class AttendanceReportController extends Controller
                 'fecha_fin'       => $fin
             ]
         ]);
+    }
+
+    public function exportar(Request $request)
+    {
+        // 1. Recibir filtros del Request
+        $userId = $request->input('user_id');
+        $fechaInicio = $request->input('fecha_inicio');
+        $fechaFin = $request->input('fecha_fin');
+
+        // 2. Construir la consulta (Misma lógica que la búsqueda)
+        $query = BiometricoAsistencia::query();
+
+        if ($userId) {
+            $query->where('user_id', 'like', "%{$userId}%");
+        }
+
+        if ($fechaInicio && $fechaFin) {
+            $query->whereBetween('fecha_hora', [
+                $fechaInicio . ' 00:00:00', 
+                $fechaFin . ' 23:59:59'
+            ]);
+        } else {
+            // Por defecto, si no hay fecha, limitamos para no descargar todo el historial
+            // O puedes poner las del mes actual:
+            $query->whereMonth('fecha_hora', Carbon::now()->month);
+        }
+
+        // 3. Ejecutar consulta (Sin paginar, traemos todo)
+        $datos = $query->orderBy('fecha_hora', 'DESC')->get();
+
+        // 4. Generar nombre del archivo
+        $nombreArchivo = 'Reporte_Asistencias_' . Carbon::now()->format('Ymd_His') . '.xlsx';
+
+        // 5. Descargar
+        return Excel::download(new ReporteAsistenciasExport($datos), $nombreArchivo);
     }
 }

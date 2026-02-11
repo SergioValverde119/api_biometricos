@@ -39,4 +39,9 @@ class BiometricoAsistencia extends Model
     {
         return $this->belongsTo(BiometricoDispositivo::class, 'sn', 'sn');
     }
+
+    public function empleado(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'user_id', 'employee_id');
+    }
 }

@@ -8,12 +8,12 @@ use Maatwebsite\Excel\Facades\Excel;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
 
 class AttendanceReportController extends Controller
 {
     /**
      * Muestra la vista inicial del monitor de asistencia.
-     * * @return \Inertia\Response
      */
     public function index()
     {
@@ -24,48 +24,50 @@ class AttendanceReportController extends Controller
     }
 
     /**
-     * Busca los registros de asistencia basados en el ID del empleado y un rango de fechas.
-     * Incluye la relación con el dispositivo para mostrar nombres/alias.
-     * * @param  \Illuminate\Http\Request  $request
-     * @return \Inertia\Response
+     * Busca los registros. Soluciona el error de PostgreSQL casteando employee_id a texto.
      */
     public function buscar(Request $request)
     {
-
         if (!$request->has('codigo_empleado')) {
-        return redirect()->route('home');
-    }
-        // 1. Validamos los datos de entrada
+            return redirect()->route('home');
+        }
+
         $request->validate([
             'codigo_empleado' => 'required|string',
             'fecha_inicio'    => 'required|date',
             'fecha_fin'       => 'required|date',
-        ], [
-            'codigo_empleado.required' => 'El ID del empleado es obligatorio.',
-            'fecha_inicio.date'        => 'La fecha de inicio no es válida.',
-            'fecha_fin.date'           => 'La fecha final no es válida.',
         ]);
 
-        $idEmpleado = $request->input('codigo_empleado');
+        $busqueda = $request->input('codigo_empleado');
         $inicio = $request->input('fecha_inicio');
         $fin = $request->input('fecha_fin');
 
-        // 2. Realizamos la consulta con Eager Loading ('dispositivo')
-        // Esto evita el error SQL al separar correctamente el ID de las fechas
-        $checadas = BiometricoAsistencia::with('dispositivo')
-            ->where('user_id', $idEmpleado)
-            ->whereBetween('fecha_hora', [
+        // Construimos la consulta con Eager Loading de dispositivo, empleado y HORARIO
+        $query = BiometricoAsistencia::with(['dispositivo', 'empleado.schedule']);
+
+        if ($busqueda) {
+            $query->where(function($q) use ($busqueda) {
+                $q->where('user_id', 'like', "%{$busqueda}%")
+                  ->orWhereIn('user_id', function($sub) use ($busqueda) {
+                      $sub->select(DB::raw('CAST(employee_id AS TEXT)'))
+                          ->from('employees')
+                          ->where('name', 'ILIKE', "%{$busqueda}%") 
+                          ->orWhere('last_name', 'ILIKE', "%{$busqueda}%");
+                  });
+            });
+        }
+
+        $checadas = $query->whereBetween('fecha_hora', [
                 $inicio . ' 00:00:00', 
                 $fin . ' 23:59:59'
             ])
-            ->orderBy('fecha_hora', 'DESC') // Mostramos lo más reciente arriba
+            ->orderBy('fecha_hora', 'DESC')
             ->get();
 
-        // 3. Devolvemos la respuesta a Inertia
         return Inertia::render('Reportes/AsistenciaCruda', [
             'checadas' => $checadas,
             'filtros'  => [
-                'codigo_empleado' => $idEmpleado,
+                'codigo_empleado' => $busqueda,
                 'fecha_inicio'    => $inicio,
                 'fecha_fin'       => $fin
             ]
@@ -74,36 +76,31 @@ class AttendanceReportController extends Controller
 
     public function exportar(Request $request)
     {
-        // 1. Recibir filtros del Request
-        $userId = $request->input('user_id');
+        $busqueda = $request->input('user_id') ?? $request->input('codigo_empleado');
         $fechaInicio = $request->input('fecha_inicio');
         $fechaFin = $request->input('fecha_fin');
 
-        // 2. Construir la consulta (Misma lógica que la búsqueda)
-        $query = BiometricoAsistencia::query();
+        $query = BiometricoAsistencia::with(['dispositivo', 'empleado.schedule']);
 
-        if ($userId) {
-            $query->where('user_id', 'like', "%{$userId}%");
+        if ($busqueda) {
+            $query->where(function($q) use ($busqueda) {
+                $q->where('user_id', 'like', "%{$busqueda}%")
+                  ->orWhereIn('user_id', function($sub) use ($busqueda) {
+                      $sub->select(DB::raw('CAST(employee_id AS TEXT)'))
+                          ->from('employees')
+                          ->where('name', 'ILIKE', "%{$busqueda}%")
+                          ->orWhere('last_name', 'ILIKE', "%{$busqueda}%");
+                  });
+            });
         }
 
         if ($fechaInicio && $fechaFin) {
-            $query->whereBetween('fecha_hora', [
-                $fechaInicio . ' 00:00:00', 
-                $fechaFin . ' 23:59:59'
-            ]);
-        } else {
-            // Por defecto, si no hay fecha, limitamos para no descargar todo el historial
-            // O puedes poner las del mes actual:
-            $query->whereMonth('fecha_hora', Carbon::now()->month);
+            $query->whereBetween('fecha_hora', [$fechaInicio . ' 00:00:00', $fechaFin . ' 23:59:59']);
         }
 
-        // 3. Ejecutar consulta (Sin paginar, traemos todo)
         $datos = $query->orderBy('fecha_hora', 'DESC')->get();
-
-        // 4. Generar nombre del archivo
         $nombreArchivo = 'Reporte_Asistencias_' . Carbon::now()->format('Ymd_His') . '.xlsx';
 
-        // 5. Descargar
         return Excel::download(new ReporteAsistenciasExport($datos), $nombreArchivo);
     }
 }
